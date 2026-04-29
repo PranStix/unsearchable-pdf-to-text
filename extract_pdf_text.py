@@ -8,6 +8,25 @@ import sys
 import tempfile
 from pathlib import Path
 
+from PIL import Image, ImageFilter, ImageOps
+
+
+LANG_ALIASES = {
+    "en": "eng",
+    "hi": "hin",
+    "es": "spa",
+    "fr": "fra",
+    "de": "deu",
+    "pt": "por",
+    "it": "ita",
+    "nl": "nld",
+    "ru": "rus",
+    "ja": "jpn",
+    "ko": "kor",
+    "zh": "chi_sim",
+    "ar": "ara",
+}
+
 
 def extract_with_pypdf(pdf_path: Path) -> str:
     """Try extracting embedded text from PDF pages using pypdf if installed."""
@@ -44,25 +63,50 @@ def run_command(command: list[str], *, cwd: Path | None = None) -> subprocess.Co
     )
 
 
-def extract_with_ocr(pdf_path: Path, lang: str, dpi: int) -> str:
-    """Render PDF pages to images with Ghostscript and OCR them with Tesseract."""
-    gs_path = shutil.which("gs")
-    tesseract_path = shutil.which("tesseract")
-    if not gs_path:
-        raise RuntimeError("Ghostscript executable 'gs' was not found in PATH")
-    if not tesseract_path:
-        raise RuntimeError("Tesseract executable 'tesseract' was not found in PATH")
+def get_tesseract_languages(tesseract_path: str) -> set[str]:
+    result = run_command([tesseract_path, "--list-langs"])
+    if result.returncode != 0:
+        return set()
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    return set(lines[1:]) if len(lines) > 1 else set()
 
-    with tempfile.TemporaryDirectory(prefix="pdf_ocr_") as tmpdir:
-        tmp = Path(tmpdir)
-        out_pattern = tmp / "page-%04d.png"
 
+def normalize_lang(lang: str) -> str:
+    key = lang.strip().lower()
+    return LANG_ALIASES.get(key, key)
+
+
+def tesseract_install_hint() -> str:
+    if sys.platform.startswith("linux"):
+        return "Install it with: sudo apt update && sudo apt install -y tesseract-ocr"
+    if sys.platform == "darwin":
+        return "Install it with: brew install tesseract"
+    if sys.platform.startswith("win"):
+        return "Install Tesseract from UB Mannheim package and add the install folder to PATH"
+    return "Install Tesseract OCR and ensure the 'tesseract' command is on PATH"
+
+
+def preprocess_image_for_ocr(image_path: Path, output_path: Path) -> Path:
+    # Grayscale + contrast + threshold improves OCR on noisy scanned pages.
+    with Image.open(image_path) as image:
+        gray = image.convert("L")
+        auto = ImageOps.autocontrast(gray, cutoff=2)
+        denoised = auto.filter(ImageFilter.MedianFilter(size=3))
+        bw = denoised.point(lambda px: 255 if px > 170 else 0, mode="1")
+        bw.save(output_path)
+    return output_path
+
+
+def render_pdf_pages(pdf_path: Path, tmp: Path, dpi: int, gs_path: str | None) -> list[Path]:
+    out_pattern = tmp / "page-%04d.png"
+
+    if gs_path:
         gs_cmd = [
             gs_path,
             "-dSAFER",
             "-dBATCH",
             "-dNOPAUSE",
-            "-sDEVICE=png16m",
+            "-sDEVICE=pnggray",
             f"-r{dpi}",
             "-o",
             str(out_pattern),
@@ -78,17 +122,72 @@ def extract_with_ocr(pdf_path: Path, lang: str, dpi: int) -> str:
         image_paths = sorted(tmp.glob("page-*.png"))
         if not image_paths:
             raise RuntimeError("No page images were produced by Ghostscript")
+        return image_paths
+
+    try:
+        import pypdfium2 as pdfium  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "Ghostscript executable 'gs' was not found in PATH and pypdfium2 is not available. "
+            "Install Ghostscript system package or install Python package pypdfium2."
+        ) from exc
+
+    doc = pdfium.PdfDocument(str(pdf_path))
+    scale = max(dpi, 72) / 72.0
+    image_paths: list[Path] = []
+    for page_idx in range(len(doc)):
+        page = doc.get_page(page_idx)
+        bitmap = page.render(scale=scale)
+        pil_image = bitmap.to_pil()
+        out_path = tmp / f"page-{page_idx + 1:04d}.png"
+        pil_image.save(out_path)
+        image_paths.append(out_path)
+        page.close()
+
+    if not image_paths:
+        raise RuntimeError("No page images were produced by pypdfium2")
+    return image_paths
+
+
+def extract_with_ocr(pdf_path: Path, lang: str, dpi: int, psm: int, oem: int) -> str:
+    """Render PDF pages to images with Ghostscript and OCR them with Tesseract."""
+    gs_path = shutil.which("gs")
+    tesseract_path = shutil.which("tesseract")
+    if not tesseract_path:
+        raise RuntimeError(
+            "Tesseract executable 'tesseract' was not found in PATH. "
+            f"{tesseract_install_hint()}"
+        )
+
+    resolved_lang = normalize_lang(lang)
+    available_langs = get_tesseract_languages(tesseract_path)
+    if available_langs and resolved_lang not in available_langs:
+        preview = ", ".join(sorted(available_langs)[:12])
+        raise RuntimeError(
+            f"Tesseract language '{lang}' resolved to '{resolved_lang}', but it is not installed. "
+            f"Installed examples: {preview}"
+        )
+
+    with tempfile.TemporaryDirectory(prefix="pdf_ocr_") as tmpdir:
+        tmp = Path(tmpdir)
+        image_paths = render_pdf_pages(pdf_path, tmp=tmp, dpi=dpi, gs_path=gs_path)
 
         page_texts: list[str] = []
         for idx, image_path in enumerate(image_paths, start=1):
+            processed_path = tmp / f"ocr-{image_path.name}"
+            preprocess_image_for_ocr(image_path, processed_path)
             tesseract_cmd = [
                 tesseract_path,
-                str(image_path),
+                str(processed_path),
                 "stdout",
                 "-l",
-                lang,
+                resolved_lang,
+                "--oem",
+                str(oem),
                 "--psm",
-                "6",
+                str(psm),
+                "-c",
+                "preserve_interword_spaces=1",
             ]
             ocr_result = run_command(tesseract_cmd)
             if ocr_result.returncode != 0:
@@ -103,10 +202,43 @@ def extract_with_ocr(pdf_path: Path, lang: str, dpi: int) -> str:
 
 
 def has_usable_text(text: str) -> bool:
-    return len("".join(text.split())) >= 80
+    body_lines = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and not line.strip().startswith("=== Page ")
+    ]
+    if not body_lines:
+        return False
+
+    compact = "".join(body_lines).replace(" ", "")
+    if len(compact) < 150:
+        return False
+
+    unique_lines = {line.lower() for line in body_lines}
+    unique_line_ratio = len(unique_lines) / max(len(body_lines), 1)
+    if unique_line_ratio < 0.5:
+        return False
+
+    words = [word.strip(".,;:!?()[]{}\"'`).-_").lower() for line in body_lines for word in line.split()]
+    words = [word for word in words if word]
+    unique_word_count = len(set(words))
+    if unique_word_count < 15:
+        return False
+
+    alnum_ratio = sum(ch.isalnum() for ch in compact) / max(len(compact), 1)
+    bad_char_ratio = compact.count("�") / max(len(compact), 1)
+    return alnum_ratio >= 0.55 and bad_char_ratio < 0.05
 
 
-def process_pdf(pdf_path: Path, output_dir: Path, lang: str, dpi: int, force_ocr: bool) -> tuple[bool, str, int]:
+def process_pdf(
+    pdf_path: Path,
+    output_dir: Path,
+    lang: str,
+    dpi: int,
+    psm: int,
+    oem: int,
+    force_ocr: bool,
+) -> tuple[bool, str, int]:
     output_path = output_dir / f"{pdf_path.stem}.txt"
 
     direct_text = extract_with_pypdf(pdf_path)
@@ -114,7 +246,7 @@ def process_pdf(pdf_path: Path, output_dir: Path, lang: str, dpi: int, force_ocr
     final_text = direct_text
 
     if force_ocr or not has_usable_text(direct_text):
-        final_text = extract_with_ocr(pdf_path, lang=lang, dpi=dpi)
+        final_text = extract_with_ocr(pdf_path, lang=lang, dpi=dpi, psm=psm, oem=oem)
         used_method = "ocr"
 
     output_path.write_text(final_text, encoding="utf-8")
@@ -141,8 +273,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dpi",
         type=int,
-        default=300,
-        help="Render DPI for OCR images (default: 300)",
+        default=400,
+        help="Render DPI for OCR images (default: 400)",
+    )
+    parser.add_argument(
+        "--psm",
+        type=int,
+        default=3,
+        help="Tesseract page segmentation mode (default: 3)",
+    )
+    parser.add_argument(
+        "--oem",
+        type=int,
+        default=1,
+        help="Tesseract OCR engine mode (default: 1)",
     )
     parser.add_argument(
         "--force-ocr",
@@ -178,6 +322,8 @@ def main() -> int:
                 output_dir=output_dir,
                 lang=args.lang,
                 dpi=args.dpi,
+                psm=args.psm,
+                oem=args.oem,
                 force_ocr=args.force_ocr,
             )
             success_count += 1
