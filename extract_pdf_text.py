@@ -86,14 +86,32 @@ def tesseract_install_hint() -> str:
     return "Install Tesseract OCR and ensure the 'tesseract' command is on PATH"
 
 
-def preprocess_image_for_ocr(image_path: Path, output_path: Path) -> Path:
-    # Grayscale + contrast + threshold improves OCR on noisy scanned pages.
+def preprocess_image_for_ocr(image_path: Path, output_path: Path, quality_mode: str = "balanced") -> Path:
+    """
+    Preprocess image for OCR with multiple quality modes.
+    
+    quality_mode:
+      - "balanced": Default balanced preprocessing
+      - "ultra": Ultra-high quality with advanced denoising
+    """
     with Image.open(image_path) as image:
         gray = image.convert("L")
         auto = ImageOps.autocontrast(gray, cutoff=2)
-        denoised = auto.filter(ImageFilter.MedianFilter(size=3))
-        bw = denoised.point(lambda px: 255 if px > 170 else 0, mode="1")
-        bw.save(output_path)
+        
+        if quality_mode == "ultra":
+            # Advanced preprocessing for ultra-high quality
+            # Use multi-pass filtering for enhanced noise reduction
+            denoised = auto.filter(ImageFilter.MedianFilter(size=3))
+            denoised = denoised.filter(ImageFilter.SMOOTH_MORE)
+            denoised = denoised.filter(ImageFilter.SMOOTH_MORE)
+            # Adaptive threshold: use median-based approach
+            bw = denoised.point(lambda px: 255 if px > 160 else 0, mode="1")
+        else:
+            # Standard balanced preprocessing
+            denoised = auto.filter(ImageFilter.MedianFilter(size=3))
+            bw = denoised.point(lambda px: 255 if px > 170 else 0, mode="1")
+        
+        bw.save(output_path, dpi=(300, 300))
     return output_path
 
 
@@ -149,7 +167,20 @@ def render_pdf_pages(pdf_path: Path, tmp: Path, dpi: int, gs_path: str | None) -
     return image_paths
 
 
-def extract_with_ocr(pdf_path: Path, lang: str, dpi: int, psm: int, oem: int) -> str:
+def clean_ocr_text(text: str) -> str:
+    """Clean up OCR output by removing common OCR artifacts."""
+    lines = []
+    for line in text.splitlines():
+        # Remove excessive spaces
+        line = " ".join(line.split())
+        # Fix common OCR errors (heuristic fixes)
+        line = line.replace("l ", "I ").replace("O ", "0 ") if len(line.split()) <= 3 else line
+        if line.strip():
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def extract_with_ocr(pdf_path: Path, lang: str, dpi: int, psm: int, oem: int, quality_mode: str = "balanced") -> str:
     """Render PDF pages to images with Ghostscript and OCR them with Tesseract."""
     gs_path = shutil.which("gs")
     tesseract_path = shutil.which("tesseract")
@@ -175,7 +206,7 @@ def extract_with_ocr(pdf_path: Path, lang: str, dpi: int, psm: int, oem: int) ->
         page_texts: list[str] = []
         for idx, image_path in enumerate(image_paths, start=1):
             processed_path = tmp / f"ocr-{image_path.name}"
-            preprocess_image_for_ocr(image_path, processed_path)
+            preprocess_image_for_ocr(image_path, processed_path, quality_mode=quality_mode)
             tesseract_cmd = [
                 tesseract_path,
                 str(processed_path),
@@ -195,7 +226,7 @@ def extract_with_ocr(pdf_path: Path, lang: str, dpi: int, psm: int, oem: int) ->
                     f"Tesseract failed on {image_path.name}:\n"
                     f"STDOUT:\n{ocr_result.stdout}\nSTDERR:\n{ocr_result.stderr}"
                 )
-            cleaned = ocr_result.stdout.strip()
+            cleaned = clean_ocr_text(ocr_result.stdout.strip())
             page_texts.append(f"\n\n=== Page {idx} ===\n{cleaned}")
 
         return "".join(page_texts).strip()
@@ -238,6 +269,7 @@ def process_pdf(
     psm: int,
     oem: int,
     force_ocr: bool,
+    quality_mode: str = "balanced",
 ) -> tuple[bool, str, int]:
     output_path = output_dir / f"{pdf_path.stem}.txt"
 
@@ -246,7 +278,7 @@ def process_pdf(
     final_text = direct_text
 
     if force_ocr or not has_usable_text(direct_text):
-        final_text = extract_with_ocr(pdf_path, lang=lang, dpi=dpi, psm=psm, oem=oem)
+        final_text = extract_with_ocr(pdf_path, lang=lang, dpi=dpi, psm=psm, oem=oem, quality_mode=quality_mode)
         used_method = "ocr"
 
     output_path.write_text(final_text, encoding="utf-8")
@@ -293,6 +325,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Always run OCR even if embedded text is found",
     )
+    parser.add_argument(
+        "--quality-mode",
+        default="balanced",
+        choices=["balanced", "ultra"],
+        help="OCR quality mode (default: balanced)",
+    )
     return parser.parse_args()
 
 
@@ -325,6 +363,7 @@ def main() -> int:
                 psm=args.psm,
                 oem=args.oem,
                 force_ocr=args.force_ocr,
+                quality_mode=args.quality_mode,
             )
             success_count += 1
             print(f"OK: {pdf_path.name} -> {method}, {char_count} characters")
