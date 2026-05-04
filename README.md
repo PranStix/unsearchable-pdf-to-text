@@ -71,16 +71,45 @@ Higher-quality OCR (recommended when text is still poor):
 python3 extract_pdf_text.py --input-dir imports --output-dir exports --force-ocr --lang eng --dpi 400 --psm 3
 ```
 
+## High-Quality Extraction (NEW)
+
+For best-quality text extraction from low-quality or heavily scanned PDFs:
+
+```bash
+python3 extract_pdf_text.py \
+    --input-dir imports \
+    --output-dir exports \
+    --force-ocr \
+    --dpi 400 \
+    --psm 3 \
+    --quality-mode ultra
+```
+
+Or use the convenience script:
+
+```bash
+python3 run_extract_high_quality.py
+```
+
+The new **`--quality-mode ultra`** option enables:
+- Advanced multi-pass image denoising
+- Adaptive contrast enhancement  
+- Threshold optimization for better character detection
+- OCR output cleanup (removing common OCR artifacts)
+
+This is recommended for scanned documents with poor quality, low contrast, or noise.
+
 ## CLI options
 
 ```text
---input-dir   Folder containing PDF files (default: current directory)
---output-dir  Folder where extracted .txt files are written (default: extracted_text)
---lang        Tesseract OCR language code (default: eng)
---dpi         Render DPI for OCR images (default: 400)
---psm         Tesseract page segmentation mode (default: 3)
---oem         Tesseract OCR engine mode (default: 1)
---force-ocr   Always run OCR even if embedded text is found
+--input-dir       Folder containing PDF files (default: current directory)
+--output-dir      Folder where extracted .txt files are written (default: extracted_text)
+--lang            Tesseract OCR language code (default: eng)
+--dpi             Render DPI for OCR images (default: 400)
+--psm             Tesseract page segmentation mode (default: 3)
+--oem             Tesseract OCR engine mode (default: 1)
+--force-ocr       Always run OCR even if embedded text is found
+--quality-mode    Image preprocessing quality (balanced|ultra, default: balanced)
 ```
 
 ## Troubleshooting poor OCR
